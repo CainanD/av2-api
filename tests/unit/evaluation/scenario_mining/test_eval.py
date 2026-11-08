@@ -112,8 +112,17 @@ def test_threshold_tuner_matches_tracking_reference(
         labels, predictions, objective, classes, num_thresholds=10
     )
     actual = tune_score_thresholds(labels, predictions, objective, classes)
-    for expected_values, actual_values in zip(expected, actual):
-        assert expected_values == actual_values
+    assert expected[0] == actual[0]
+    # Spawn workers initialize NumPy aliases independently; TrackEval may
+    # reduce float64 arrays there versus float32 in the parent process.
+    for expected_values, actual_values in zip(expected[1:], actual[1:]):
+        assert expected_values.keys() == actual_values.keys()
+        np.testing.assert_allclose(
+            list(actual_values.values()),
+            list(expected_values.values()),
+            rtol=np.finfo(np.float32).eps,
+            atol=np.finfo(np.float32).eps,
+        )
 
 
 def test_track_free_cli_and_timestamp_alignment(tmp_path: Path) -> None:
