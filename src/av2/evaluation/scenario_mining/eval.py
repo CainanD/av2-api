@@ -8,7 +8,6 @@ Evaluation Metrics:
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
-from copy import deepcopy
 import pickle
 import click
 from packaging import version
@@ -41,9 +40,7 @@ from av2.evaluation.detection.utils import load_mapped_avm_and_egoposes
 from av2.evaluation.tracking.eval import (
     yaw_to_quaternion3d,
     filter_max_dist,
-    _tune_score_thresholds,
 )
-from av2.evaluation.tracking.utils import filter_by_class_thresholds
 
 from av2.evaluation.scenario_mining import (
     SEQ_ID_LOG_INDICES,
@@ -52,6 +49,9 @@ from av2.evaluation.scenario_mining import (
 )
 from av2.utils.typing import NDArrayFloat
 from av2.evaluation.typing import Sequences
+
+from av2.evaluation.scenario_mining.thresholds import tune_score_thresholds
+from av2.evaluation.scenario_mining.serialization import load_predictions
 
 REFERRED_OBJECT = SCENARIO_MINING_CATEGORIES.index("REFERRED_OBJECT")
 
@@ -113,12 +113,17 @@ def _plot_confusion_matrix(
     plt.close()
 
 
-def filter_drivable_area(tracks: Sequences, dataset_dir: Optional[str]) -> Sequences:
+def filter_drivable_area(
+    tracks: Sequences,
+    dataset_dir: Optional[str],
+    maps: Optional[Dict[str, ArgoverseStaticMap]] = None,
+) -> Sequences:
     """Convert the unified label format to a format that is easier to work with for forecasting evaluation.
 
     Args:
         tracks: Dictionary of tracks
         dataset_dir: Dataset root directory
+        maps: Already loaded maps, shared between labels and predictions.
 
     Returns:
         tracks: Dictionary of tracks.
@@ -129,12 +134,13 @@ def filter_drivable_area(tracks: Sequences, dataset_dir: Optional[str]) -> Seque
     log_prompt_pairs = list(tracks.keys())
     log_ids = [seq_id[SEQ_ID_LOG_INDICES] for seq_id in tracks.keys()]
 
-    log_id_to_avm, log_id_to_timestamped_poses = load_mapped_avm_and_egoposes(
-        log_ids, Path(dataset_dir)
-    )
+    if maps is None:
+        maps, _ = load_mapped_avm_and_egoposes(
+            list(dict.fromkeys(log_ids)), Path(dataset_dir)
+        )
 
     for i, log_id in enumerate(log_ids):
-        avm = log_id_to_avm[log_id]
+        avm = maps[log_id]
 
         for frame in tracks[log_prompt_pairs[i]]:
             translation_m = frame["translation_m"]
@@ -195,7 +201,7 @@ def compute_objects_in_roi_mask(
 def referred_full_tracks(sequences: Sequences) -> Sequences:
     """Expands the predicted partial tracks to the whole length of the track_id.
 
-    Reconstructs a mining pkl file by propagating referred object labels across all instances
+    Reconstructs mining sequences by propagating referred object labels across all instances
     of the same track_id and removing all other objects.
 
     Args:
@@ -219,7 +225,7 @@ def referred_full_tracks(sequences: Sequences) -> Sequences:
         for frame in frames:
             # Create mask for referred track_ids
             mask = np.isin(frame["track_id"], list(referred_track_ids))
-            new_frame = deepcopy(frame)
+            new_frame = dict(frame)
 
             new_names = np.zeros(len(frame["name"]), dtype="<U31")
             for i in range(len(frame["name"])):
@@ -237,12 +243,42 @@ def referred_full_tracks(sequences: Sequences) -> Sequences:
     return reconstructed_sequences
 
 
+def _prune_unreferred_tracks(sequences: Sequences) -> Sequences:
+    """Discard IDs that cannot contribute to either tracking metric.
+
+    Full-track evaluation expands only IDs referred to at least once. Range and
+    ROI filtering can remove referred instances, but cannot introduce new ones.
+    Keeping these candidate IDs before geometry filtering is therefore exact.
+    """
+    result = {}
+    for seq_id, frames in sequences.items():
+        referred_ids = np.unique(
+            np.concatenate(
+                [
+                    frame["track_id"][frame["label"] == REFERRED_OBJECT]
+                    for frame in frames
+                ]
+            )
+        )
+        selected = []
+        for frame in frames:
+            keep = np.isin(frame["track_id"], referred_ids)
+            selected.append(
+                {
+                    key: value[keep] if isinstance(value, np.ndarray) else value
+                    for key, value in frame.items()
+                }
+            )
+        result[seq_id] = selected
+    return result
+
+
 def _safe_rate(numerator: int, denominator: int) -> float:
     return float(numerator / denominator) if denominator else 1.0
 
 
 def compute_temporal_metrics(
-    track_predictions: Sequences, labels: Sequences, output_dir: str
+    track_predictions: Sequences, labels: Sequences, output_dir: Optional[str]
 ) -> tuple[dict[str, float], dict[str, float]]:
     """Calculates the balanced accuracy for log and timestamp retrival.
 
@@ -452,10 +488,10 @@ def evaluate(
     labels: Sequences,
     objective_metric: str,
     max_range_m: int,
-    dataset_dir: str,
-    out: str,
+    dataset_dir: Optional[str],
+    out: Optional[str],
 ) -> tuple[float, float, float, float]:
-    """Run scenario mining evaluation on the supplied prediction and label pkl files.
+    """Run scenario mining evaluation on prediction and ground-truth sequences.
 
     If tracks are not submitted within the scenario_predictions dictionary, only temporal metrics will be computed.
 
@@ -473,9 +509,32 @@ def evaluate(
         timestamp_ba: A retrieval/classification metric for determining if each timestamp contains any instance of the prompt.
         scenario_ba: A retrieval/classification metric for determining if each data log contains any instance of the prompt.
     """
+    # Copy frame dictionaries so normalization never modifies caller inputs.
+    labels = {seq: [dict(frame) for frame in frames] for seq, frames in labels.items()}
+    scenario_predictions = {
+        seq: [dict(frame) for frame in frames]
+        for seq, frames in scenario_predictions.items()
+    }
+
     # Submissions may have sequence ids of form (log_id, prompt) or f"({log_id}, {prompt})"
     labels = relabel_sequence_ids(labels)
     scenario_predictions = relabel_sequence_ids(scenario_predictions)
+
+    if set(labels) != set(scenario_predictions):
+        raise ValueError("Prediction sequences must match ground truth")
+    for seq_id, frames in labels.items():
+        predictions_by_time = {
+            frame["timestamp_ns"]: frame for frame in scenario_predictions[seq_id]
+        }
+        timestamps = [frame["timestamp_ns"] for frame in frames]
+        if len(predictions_by_time) != len(scenario_predictions[seq_id]) or set(
+            predictions_by_time
+        ) != set(timestamps):
+            raise ValueError("Prediction timestamps must match ground truth")
+        scenario_predictions[seq_id] = [predictions_by_time[t] for t in timestamps]
+        for prediction, reference in zip(scenario_predictions[seq_id], frames):
+            if "track_id" in prediction:
+                prediction["ego_translation_m"] = reference["ego_translation_m"]
 
     if out:
         Path(out).mkdir(exist_ok=True, parents=True)
@@ -502,14 +561,21 @@ def evaluate(
 
     if contains_tracking:
 
+        labels = _prune_unreferred_tracks(labels)
+        scenario_predictions = _prune_unreferred_tracks(scenario_predictions)
         labels = filter_max_dist(labels, max_range_m)
         scenario_predictions = filter_max_dist(scenario_predictions, max_range_m)
 
         if dataset_dir is not None:
-            labels = filter_drivable_area(labels, dataset_dir)
-            scenario_predictions = filter_drivable_area(
-                scenario_predictions, dataset_dir
+            log_ids = list(
+                dict.fromkeys(seq_id[SEQ_ID_LOG_INDICES] for seq_id in labels)
             )
+            maps, _ = load_mapped_avm_and_egoposes(log_ids, Path(dataset_dir))
+            labels = filter_drivable_area(labels, dataset_dir, maps)
+            scenario_predictions = filter_drivable_area(
+                scenario_predictions, dataset_dir, maps
+            )
+            del maps
 
         hota_temporal_by_class, scenario_ba_by_class, timestamp_ba_by_class = (
             evaluate_scenario_mining(
@@ -533,9 +599,6 @@ def evaluate(
         timestamp_ba = float(np.mean(np.array(list(timestamp_ba_by_class.values()))))
         scenario_ba = float(np.mean(np.array(list(scenario_ba_by_class.values()))))
     else:
-
-        scenario_predictions = classify_referred_objects(scenario_predictions)
-        labels = classify_referred_objects(labels)
 
         scenario_ba_by_class, timestamp_ba_by_class = compute_temporal_metrics(
             scenario_predictions, labels, out
@@ -581,7 +644,7 @@ def evaluate_scenario_mining(
     track_predictions: Sequences,
     track_labels: Sequences,
     objective_metric: str,
-    out: str,
+    out: Optional[str],
     full_tracks: bool = False,
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
     """Run evaluation.
@@ -600,8 +663,13 @@ def evaluate_scenario_mining(
         scenario_ba_by_class: A retrieval/classification metric for determining if each data log contains any instance of the prompt.
         timestamp_ba_by_class: A retrieval/classification metric for determining if each timestamp contains any instance of the prompt.
     """
-    scenario_predictions = deepcopy(track_predictions)
-    labels = deepcopy(track_labels)
+    scenario_predictions = {
+        seq: [dict(frame) for frame in frames]
+        for seq, frames in track_predictions.items()
+    }
+    labels = {
+        seq: [dict(frame) for frame in frames] for seq, frames in track_labels.items()
+    }
 
     if full_tracks:
         scenario_predictions = referred_full_tracks(scenario_predictions)
@@ -611,7 +679,7 @@ def evaluate_scenario_mining(
     scenario_predictions = classify_referred_objects(scenario_predictions)
     labels = classify_referred_objects(labels)
 
-    score_thresholds, optimal_metric_by_class, _ = _tune_score_thresholds(
+    score_thresholds, optimal_metric_by_class, _ = tune_score_thresholds(
         labels,
         scenario_predictions,
         objective_metric,
@@ -624,9 +692,23 @@ def evaluate_scenario_mining(
         for prompt, metric_value in optimal_metric_by_class.items()
     }
 
-    filtered_scenario_predictions = filter_by_class_thresholds(
-        scenario_predictions, score_thresholds
-    )
+    filtered_scenario_predictions = {
+        seq_id: [
+            {
+                key: (
+                    value[
+                        frame["score"]
+                        >= score_thresholds[seq_id[SEQ_ID_PROMPT_INDICES]]
+                    ]
+                    if isinstance(value, np.ndarray)
+                    else value
+                )
+                for key, value in frame.items()
+            }
+            for frame in frames
+        ]
+        for seq_id, frames in scenario_predictions.items()
+    }
     scenario_ba_by_class, timestamp_ba_by_class = compute_temporal_metrics(
         filtered_scenario_predictions, labels, out
     )
@@ -634,7 +716,7 @@ def evaluate_scenario_mining(
 
 
 @click.command()
-@click.option("--predictions", required=True, help="Predictions PKL file")
+@click.option("--predictions", required=True, help="Predictions JSON file")
 @click.option("--ground_truth", required=True, help="Ground Truth PKL file")
 @click.option(
     "--max_range_m",
@@ -658,8 +740,7 @@ def runner(
     out: str,
 ) -> None:
     """Standalone evaluation function."""
-    with open(predictions, "rb") as f:
-        track_predictions = pickle.load(f)
+    track_predictions = load_predictions(predictions)
     with open(ground_truth, "rb") as f:
         labels = pickle.load(f)
 
