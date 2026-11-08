@@ -3,19 +3,22 @@
 """Kernels for fast drawing operations."""
 
 from math import exp
-from typing import Final, Tuple
+from typing import Final, Tuple, TypeVar, Union
 
 import numba as nb
 import numpy as np
 
+from av2.utils.numba import njit
 from av2.utils.constants import NAN
 from av2.utils.typing import NDArrayByte, NDArrayFloat, NDArrayInt, NDArrayNumber
+
+ArrayT = TypeVar("ArrayT", bound=NDArrayNumber)
 
 UINT8_MAX: Final = np.iinfo(np.uint8).max
 UINT8_BITS: Final = np.log2(UINT8_MAX + 1).astype(np.uint8)
 
 
-@nb.njit
+@njit
 def integer_linear_interpolation(
     x: np.uint8, y: np.uint8, alpha: np.uint16, beta: np.uint16
 ) -> np.uint8:
@@ -44,9 +47,9 @@ def integer_linear_interpolation(
     return linear_interpolant
 
 
-@nb.njit
+@njit
 def alpha_blend_kernel(
-    fg: NDArrayByte, bg: NDArrayByte, alpha: np.uint8
+    fg: NDArrayByte, bg: NDArrayByte, alpha: Union[int, np.uint8]
 ) -> Tuple[np.uint8, np.uint8, np.uint8]:
     """Fast integer alpha blending.
 
@@ -73,7 +76,7 @@ def alpha_blend_kernel(
     return r, g, b
 
 
-@nb.njit
+@njit
 def gaussian_kernel(x: float, mu: float, sigma: float) -> float:
     """Return a univariate Gaussian kernel.
 
@@ -88,16 +91,16 @@ def gaussian_kernel(x: float, mu: float, sigma: float) -> float:
     return exp(-0.5 * (x - mu) ** 2 / (sigma**2))
 
 
-@nb.njit
+@njit
 def draw_points_kernel(
-    img: NDArrayNumber,
+    img: ArrayT,
     points_uv: NDArrayInt,
     colors: NDArrayByte,
     diameter: int = 1,
     alpha: float = 1.0,
     with_anti_alias: bool = False,
     sigma: float = 1.0,
-) -> NDArrayNumber:
+) -> ArrayT:
     """Draw points onto an image canvas.
 
     NOTE: Anti-aliasing will apply a Gaussian kernel at each uv -- parameterized
@@ -145,7 +148,7 @@ def draw_points_kernel(
     return img
 
 
-@nb.njit(nogil=True)
+@njit(nogil=True)
 def clip_line_frustum(
     p1: NDArrayFloat, p2: NDArrayFloat, planes: NDArrayFloat
 ) -> NDArrayFloat:
