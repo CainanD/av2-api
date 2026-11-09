@@ -127,7 +127,9 @@ def draw_line_frustum(
     Returns:
         The image with a line clipped and drawn inside the frustum (if it's visible).
     """
-    clipped_points = clip_line_frustum(p1, p2, cam_model.frustum_planes())
+    clipped_points = clip_line_frustum(
+        np.asarray(p1), np.asarray(p2), cam_model.frustum_planes()
+    )
     intersects_with_frustum = not bool(np.isnan(clipped_points).any())
     if intersects_with_frustum:
         # After clipping the line segment to the view frustum in the camera coordinate frame, we obtain

@@ -51,15 +51,15 @@ def test_alpha_blend_kernel() -> None:
 
     alpha = 0
     blended_pixel = alpha_blend_kernel(fg, bg, alpha)
-    assert blended_pixel == (64, 64, 64)
+    np.testing.assert_array_equal(blended_pixel, (64, 64, 64))
 
     alpha = 128
     blended_pixel = alpha_blend_kernel(fg, bg, alpha)
-    assert blended_pixel == (96, 96, 96)
+    np.testing.assert_array_equal(blended_pixel, (96, 96, 96))
 
     alpha = 255
     blended_pixel = alpha_blend_kernel(fg, bg, alpha)
-    assert blended_pixel == (128, 128, 128)
+    np.testing.assert_array_equal(blended_pixel, (128, 128, 128))
 
 
 def test_gaussian_kernel() -> None:
