@@ -120,8 +120,8 @@ def test_threshold_tuner_matches_tracking_reference(
         np.testing.assert_allclose(
             list(actual_values.values()),
             list(expected_values.values()),
-            rtol=np.finfo(np.float32).eps,
-            atol=np.finfo(np.float32).eps,
+            rtol=float(np.finfo(np.float32).eps),
+            atol=float(np.finfo(np.float32).eps),
         )
 
 
